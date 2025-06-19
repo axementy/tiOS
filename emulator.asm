@@ -16,13 +16,61 @@
 ; Define a segment for EEPROM data.
 ; The 4-bit computer's program will be stored here.
 ; Each instruction is 1 byte (4-bit opcode, 4-bit operand).
-; We have 16 such instructions.
+; Program memory is now 512 lines (bytes) - max for ATmega8.
 ;-------------------------------------------------------------------------------
 .eseg                 ; EEPROM segment
 .org 0x0000           ; Start at the beginning of EEPROM
 EMULATOR_PROGRAM_MEMORY:
-  .db 0, 0, 0, 0, 0, 0, 0, 0 ; Define 16 bytes for program storage, initialized to 0
-  .db 0, 0, 0, 0, 0, 0, 0, 0 ; (NOP instructions effectively)
+  ; Tutorial 1: Blink (alternates Accu between RAM[0]=0x5 and RAM[1]=0xA)
+  ; RAM[0]=0x5, RAM[1]=0xA pre-loaded by emulator.
+  ; Program Start: 0x000
+  .db 0x10 ; 0x000: LDA 0x0 (A = RAM[0]=0x5)
+  .db 0xF0 ; 0x001: OUT       (Display A)
+  .db 0x11 ; 0x002: LDA 0x1 (A = RAM[1]=0xA)
+  .db 0xF0 ; 0x003: OUT       (Display A)
+  .db 0x9B ; 0x004: JMP -5  (Target 0x000. PC_after_fetch=5. 5 + (-5) = 0)
+  ; End of T1, PC=0x005. Next available: 0x005
+  .db 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 ; Padding to 0x010 (11 bytes)
+
+  .org 0x010 ; Start Tutorial 2 at 0x010
+
+  ; Tutorial 2: Button Counter (Counts presses of button 0 on data port to RAM[0xF])
+  ; RAM[0xD]=0x1 (mask), RAM[0xE]=0x1 (one), RAM[0xF]=0x0 (counter) pre-loaded.
+  .db 0xE0 ; 0x010: IN              (Read buttons to A)
+  .db 0x5D ; 0x011: AND RAM[0xD]    (A = A & RAM[0xD_mask_1])
+  .db 0xA3 ; 0x012: JZ +3           (If A=0, jump to 0x016. PC_after_fetch=0x13. 0x13+3 = 0x016)
+  .db 0x1F ; 0x013: LDA RAM[0xF]    (A = counter)
+  .db 0x3E ; 0x014: ADD RAM[0xE]    (A = A + RAM[0xE_one])
+  .db 0x2F ; 0x015: STA RAM[0xF]    (counter = A)
+  ; NO_PRESS (target of JZ from 0x012):
+  .db 0x1F ; 0x016: LDA RAM[0xF]    (A = counter)
+  .db 0xF0 ; 0x017: OUT             (Display counter)
+  .db 0x98 ; 0x018: JMP -8          (Target 0x011. PC_after_fetch=0x19. 0x19 + (-8) = 0x011)
+  ; End of T2, PC=0x019. Next available: 0x019
+  .db 0x00,0x00,0x00,0x00,0x00,0x00,0x00 ; Padding to 0x020 (7 bytes)
+
+  .org 0x020 ; Start Tutorial 3 at 0x020
+
+  ; Tutorial 3: Conditional LED (Button 0 -> Accu=1 (ON) or Accu=0 (OFF))
+  ; RAM[0xB]=0x0 (OFF), RAM[0xC]=0x1 (ON), RAM[0xD]=0x1 (mask) pre-loaded.
+  .db 0xE0 ; 0x020: IN                  (Read buttons to A)
+  .db 0x5D ; 0x021: AND RAM[0xD]        (A = A & RAM[0xD_mask_1])
+  .db 0xB2 ; 0x022: JNZ +2             (If A!=0, jump to 0x025. PC_after_fetch=0x023. 0x023+2 = 0x025)
+  ; Button not pressed:
+  .db 0x1B ; 0x023: LDA RAM[0xB]        (A = RAM[0xB_LED_OFF_0])
+  .db 0x91 ; 0x024: JMP +1              (Jump to 0x026. PC_after_fetch=0x025. 0x025+1 = 0x026)
+  ; BTN_IS_PRESSED (target of JNZ from 0x022):
+  .db 0x1C ; 0x025: LDA RAM[0xC]        (A = RAM[0xC_LED_ON_1])
+  ; DISPLAY_LED (target of JMP from 0x024):
+  .db 0xF0 ; 0x026: OUT                 (Display A)
+  .db 0x98 ; 0x027: JMP -8             (Target 0x020. PC_after_fetch=0x028. 0x028 + (-8) = 0x020)
+  ; End of T3, PC=0x028.
+
+  ; Fill remaining EEPROM with NOPs (0x00) up to 512 bytes
+  .org 0x028
+  .rept 512 - (0x028)
+  .db 0x00
+  .endr
 
 ;-------------------------------------------------------------------------------
 ; Equates and Definitions
@@ -67,12 +115,15 @@ EMULATOR_PROGRAM_MEMORY:
 ; --- Emulator State Variables (Registers) ---
 .def reg_temp1       = r16
 .def reg_temp2       = r17
+; --- PC High Nibble ---
+.def reg_pc_high_nibble = r2  ; Upper 4 bits of the 12-bit PC
 .def reg_pc          = r18
 .def reg_accu        = r19
 .def reg_flags       = r20
 .def reg_ir_opcode   = r21
 .def reg_ir_operand  = r22
-.def reg_mem_addr    = r23
+.def reg_mem_addr_low = r23 ; Lower 8 bits of memory address for EEPROM
+.def reg_mem_addr_high_nibble = r3 ; Upper 4 bits of memory address (only LSB used for A8 of EEARH)
 .def reg_lcd_char    = r24
 .def reg_last_ctrl_btn_state = r26
 .def reg_current_ctrl_btn_state = r27
@@ -141,6 +192,7 @@ emulate_one_cycle_from_run_mode:
 
 ; --- Button Action Handlers ---
 handle_reset_pc_press:
+  ldi reg_pc_high_nibble, 0x00 ; Reset PC high nibble
   ldi reg_pc, 0x00
   ldi reg_accu, 0x00
   ldi reg_flags, 0x00
@@ -188,11 +240,44 @@ init_ports:
   ret
 
 init_emulator:
+  ldi reg_pc_high_nibble, 0x00 ; Initialize PC high nibble
   ldi reg_pc, 0x00
   ldi reg_accu, 0x00
   ldi reg_flags, 0x00
   rcall init_emulator_status
   rcall clear_emulated_ram ; Clear emulated RAM
+
+  ; --- Pre-load Emulated RAM for Tutorial Programs ---
+  ldi reg_temp1, 0x05       ; Value 0x5
+  ldi reg_temp2, 0x00       ; RAM Address 0x0
+  rcall set_emulated_ram_nibble ; Store it
+
+  ldi reg_temp1, 0x0A       ; Value 0xA
+  ldi reg_temp2, 0x01       ; RAM Address 0x1
+  rcall set_emulated_ram_nibble ; Store it
+
+  ldi reg_temp1, 0x01       ; Value 0x1 (mask for T2 & T3)
+  ldi reg_temp2, 0x0D       ; RAM Address 0xD
+  rcall set_emulated_ram_nibble
+
+  ldi reg_temp1, 0x01       ; Value 0x1 (one for T2)
+  ldi reg_temp2, 0x0E       ; RAM Address 0xE
+  rcall set_emulated_ram_nibble
+
+  ldi reg_temp1, 0x00       ; Value 0x0 (counter init for T2)
+  ldi reg_temp2, 0x0F       ; RAM Address 0xF
+  rcall set_emulated_ram_nibble
+
+  ldi reg_temp1, 0x00       ; Value 0x0 (LED_OFF_VAL for T3)
+  ldi reg_temp2, 0x0B       ; RAM Address 0xB
+  rcall set_emulated_ram_nibble
+
+  ldi reg_temp1, 0x01       ; Value 0x1 (LED_ON_VAL for T3)
+  ldi reg_temp2, 0x0C       ; RAM Address 0xC
+  rcall set_emulated_ram_nibble
+
+  ; TUTORIAL_RAM_PRELOAD_DONE
+  ; End of Pre-load for tutorials
   ret
 
 init_button_states:
@@ -433,7 +518,12 @@ read_data_buttons_bounce:
 eeprom_write_byte:
   sbic EECR, EEWE
   rjmp eeprom_write_wait_prev
-  out EEARL, reg_mem_addr
+  out EEARL, reg_mem_addr_low ; EEPROM Address Low Byte
+  push reg_temp1 ; Save reg_temp1 as it's used to manipulate high address bits
+  mov reg_temp1, reg_mem_addr_high_nibble ; Get high nibble of address
+  andi reg_temp1, 0x01        ; Mask to get only A8 (LSB of high nibble for ATmega8's EEARH)
+  out EEARH, reg_temp1        ; Set EEPROM Address High (A8)
+  pop reg_temp1 ; Restore reg_temp1
   out EEDR, reg_temp1
   sbi EECR, EEMWE
   sbi EECR, EEWE
@@ -445,7 +535,12 @@ eeprom_write_wait_prev:
 eeprom_read_byte:
   sbic EECR, EEWE
   rjmp eeprom_read_wait_write
-  out EEARL, reg_mem_addr
+  out EEARL, reg_mem_addr_low ; EEPROM Address Low Byte
+  push reg_temp1 ; Save reg_temp1
+  mov reg_temp1, reg_mem_addr_high_nibble ; Get high nibble of address
+  andi reg_temp1, 0x01        ; Mask to get only A8
+  out EEARH, reg_temp1        ; Set EEPROM Address High (A8)
+  pop reg_temp1 ; Restore reg_temp1
   sbi EECR, EERE
   in reg_temp1, EEDR
   ret
@@ -457,16 +552,35 @@ eeprom_read_wait_write:
 ; Emulator Core Logic
 ;-------------------------------------------------------------------------------
 fetch_instruction:
-  mov reg_mem_addr, reg_pc
-  rcall eeprom_read_byte
+  ; Fetches instruction from EEPROM using 12-bit PC (reg_pc_high_nibble:reg_pc).
+  ; Stores opcode in reg_ir_opcode, operand in reg_ir_operand.
+  ; Increments 12-bit PC.
+  ; Input: reg_pc (r18), reg_pc_high_nibble (r2)
+  ; Output: reg_ir_opcode, reg_ir_operand, updated PC regs.
+  ; Clobbers: reg_temp1, reg_mem_addr_low (r23), reg_mem_addr_high_nibble (r3)
+
+  ; Prepare address for EEPROM read
+  mov reg_mem_addr_low, reg_pc             ; Low byte of PC to EEARL part of address
+  mov reg_mem_addr_high_nibble, reg_pc_high_nibble ; High nibble of PC to EEARH part of address
+
+  rcall eeprom_read_byte   ; Reads byte into reg_temp1 (r16)
+
+  ; Separate opcode and operand
   mov reg_ir_opcode, reg_temp1
   swap reg_ir_opcode
-  andi reg_ir_opcode, 0x0F
+  andi reg_ir_opcode, 0x0F    ; Opcode
+
   mov reg_ir_operand, reg_temp1
-  andi reg_ir_operand, 0x0F
-  inc reg_pc
-  andi reg_pc, 0x0F
-  sbr reg_emulator_status, (1<<DISPLAY_UPDATE_NEEDED_BIT_POS)
+  andi reg_ir_operand, 0x0F   ; Operand
+
+  ; Increment 12-bit Program Counter (reg_pc_high_nibble : reg_pc)
+  inc reg_pc                  ; Increment low byte
+  brne fetch_pc_inc_done    ; If low byte didn't wrap, we are done with low
+  ; Low byte wrapped, so increment high nibble
+  inc reg_pc_high_nibble
+  andi reg_pc_high_nibble, 0x0F ; Mask to 4 bits (0-F page range for 12-bit PC: 0x000-0xFFF)
+fetch_pc_inc_done:
+  sbr reg_emulator_status, (1<<DISPLAY_UPDATE_NEEDED_BIT_POS) ; Mark display for update
   ret
 
 decode_instruction:
@@ -754,49 +868,48 @@ instr_NOT: ; Opcode 8
   pop ZL
   ret
 
-instr_JMP: ; Opcode 9 - Jump
-  mov reg_pc, reg_ir_operand
-  andi reg_pc, 0x0F
+instr_JMP: ; Opcode 9 - Jump (PC-Relative)
+  rcall perform_relative_jump
   sbr reg_emulator_status, (1<<DISPLAY_UPDATE_NEEDED_BIT_POS)
-  pop reg_temp1 ; Balance stack
+  pop reg_temp1 ; Balance stack from execute_instruction dispatcher
   pop ZH
   pop ZL
   ret
 
-instr_JZ: ; Opcode A - Jump if Zero
-  sbrs reg_flags, FLAG_Z_BIT
-  rjmp instr_JMP_no_pop_for_branch ; If Z is set, perform the jump (which will pop)
+instr_JZ: ; Opcode A - Jump if Zero (PC-Relative)
+  sbrc reg_flags, FLAG_Z_BIT  ; Skip next instruction if Zero flag is clear
+  rcall perform_relative_jump ; If Z is set, perform the relative jump
   sbr reg_emulator_status, (1<<DISPLAY_UPDATE_NEEDED_BIT_POS)
-  pop reg_temp1 ; Balance stack if no jump
-  pop ZH
-  pop ZL
-  ret
-instr_JMP_no_pop_for_branch:
-  rjmp instr_JMP
-
-instr_JNZ: ; Opcode B - Jump if Not Zero
-  sbrc reg_flags, FLAG_Z_BIT
-  rjmp instr_JMP_no_pop_for_branch ; If Z is clear, perform the jump
-  sbr reg_emulator_status, (1<<DISPLAY_UPDATE_NEEDED_BIT_POS)
-  pop reg_temp1 ; Balance stack if no jump
+  pop reg_temp1 ; Balance stack from execute_instruction dispatcher
   pop ZH
   pop ZL
   ret
 
-instr_JC: ; Opcode C - Jump if Carry
-  sbrs reg_flags, FLAG_C_BIT
-  rjmp instr_JMP_no_pop_for_branch ; If C is set, perform the jump
+; Removed instr_JMP_no_pop_for_branch as it's no longer needed with direct calls
+
+instr_JNZ: ; Opcode B - Jump if Not Zero (PC-Relative)
+  sbrs reg_flags, FLAG_Z_BIT  ; Skip next instruction if Zero flag is set
+  rcall perform_relative_jump ; If Z is clear, perform the relative jump
   sbr reg_emulator_status, (1<<DISPLAY_UPDATE_NEEDED_BIT_POS)
-  pop reg_temp1 ; Balance stack if no jump
+  pop reg_temp1 ; Balance stack from execute_instruction dispatcher
   pop ZH
   pop ZL
   ret
 
-instr_JNC: ; Opcode D - Jump if No Carry
-  sbrc reg_flags, FLAG_C_BIT
-  rjmp instr_JMP_no_pop_for_branch ; If C is clear, perform the jump
+instr_JC: ; Opcode C - Jump if Carry (PC-Relative)
+  sbrc reg_flags, FLAG_C_BIT  ; Skip next instruction if Carry flag is clear
+  rcall perform_relative_jump ; If C is set, perform the relative jump
   sbr reg_emulator_status, (1<<DISPLAY_UPDATE_NEEDED_BIT_POS)
-  pop reg_temp1 ; Balance stack if no jump
+  pop reg_temp1 ; Balance stack from execute_instruction dispatcher
+  pop ZH
+  pop ZL
+  ret
+
+instr_JNC: ; Opcode D - Jump if No Carry (PC-Relative)
+  sbrs reg_flags, FLAG_C_BIT  ; Skip next instruction if Carry flag is set
+  rcall perform_relative_jump ; If C is clear, perform the relative jump
+  sbr reg_emulator_status, (1<<DISPLAY_UPDATE_NEEDED_BIT_POS)
+  pop reg_temp1 ; Balance stack from execute_instruction dispatcher
   pop ZH
   pop ZL
   ret
@@ -814,17 +927,17 @@ instr_IN: ; Opcode E - Input from buttons to Accumulator
 
 instr_OUT: ; Opcode F - Output Accumulator to LCD (special spot)
   push reg_temp2
-  push ZL      ; lcd_set_cursor and lcd_print_string_P use Z
+  push ZL
   push ZH
-  push reg_lcd_char ; lcd_write_data uses this
+  push reg_lcd_char
 
-  ldi reg_temp1, 1      ; Row 1
-  ldi reg_temp2, 10     ; Col 10
+  ldi reg_temp1, 1
+  ldi reg_temp2, 10
   rcall lcd_set_cursor
 
   ldi ZL, low(LcdMsg_OUT*2)
   ldi ZH, high(LcdMsg_OUT*2)
-  rcall lcd_print_string_P ; "OUT:"
+  rcall lcd_print_string_P
 
   mov reg_temp2, reg_accu
   rcall lcd_print_hex_nibble
@@ -835,9 +948,9 @@ instr_OUT: ; Opcode F - Output Accumulator to LCD (special spot)
   pop reg_temp2
   sbr reg_emulator_status, (1<<DISPLAY_UPDATE_NEEDED_BIT_POS)
   pop reg_temp1 ; Balance stack from execute_instruction
-  pop ZH        ; (these two were for ijmp, already popped if NOP)
-  pop ZL        ; This is getting complex. Each handler should pop what execute_instruction pushed.
-  ret             ; The pops for ZL, ZH, reg_temp1 are from execute_instruction.
+  pop ZH
+  pop ZL
+  ret
 
 ;-------------------------------------------------------------------------------
 ; Utility Routines
@@ -871,20 +984,19 @@ delay_4_cycles_calib:
   ret
 
 clear_emulated_ram:
-  ; Clears the 8 bytes of EMULATED_RAM in SRAM
-  push ZL               ; Preserve ZL, ZH, reg_temp1, reg_temp2
+  push ZL
   push ZH
   push reg_temp1
   push reg_temp2
 
   ldi ZL, low(EMULATED_RAM)
   ldi ZH, high(EMULATED_RAM)
-  ldi reg_temp1, 0x00   ; Value to clear with
-  ldi reg_temp2, 8      ; Number of bytes to clear (size of EMULATED_RAM)
+  ldi reg_temp1, 0x00
+  ldi reg_temp2, 8
 clear_emulated_ram_loop:
-  st Z+, reg_temp1      ; Store 0x00 in current RAM location, increment Z
-  dec reg_temp2         ; Decrement byte counter
-  brne clear_emulated_ram_loop ; Loop if not all bytes cleared
+  st Z+, reg_temp1
+  dec reg_temp2
+  brne clear_emulated_ram_loop
 
   pop reg_temp2
   pop reg_temp1
@@ -892,32 +1004,151 @@ clear_emulated_ram_loop:
   pop ZL
   ret
 
+; --- Helper to set a nibble in EMULATED_RAM directly by emulator ---
+; Input: reg_temp1 = 4-bit value to store
+;        reg_temp2 = nibble address (0-15)
+; Uses: Z, scratch1 (r4), scratch2 (r5)
+.def scratch1 = r4 ; Define scratch registers if not defined globally
+.def scratch2 = r5
+set_emulated_ram_nibble:
+  push scratch1
+  push scratch2
+  push ZL
+  push ZH
+  push reg_temp1 ; Save input value as reg_temp1 is clobbered by get_emulated_ram_nibble_location_for_set
+  push reg_temp2 ; Save input address as reg_temp2 is clobbered by get_emulated_ram_nibble_location_for_set
+
+  mov scratch2, reg_temp2 ; RAM Address from reg_temp2 (original input)
+  rcall get_emulated_ram_nibble_location_for_set ; Z pts to byte, scratch1 has L/U flag (uses scratch1, scratch2)
+
+  ld scratch2, Z          ; Load current byte from EMULATED_RAM (scratch2 gets existing byte)
+
+  pop reg_temp2 ; Restore original address to reg_temp2 (no longer needed)
+  pop reg_temp1 ; Restore original value to reg_temp1
+
+  cpi scratch1, 0         ; Test L/U flag from scratch1. Storing to lower nibble (flag=0)?
+  breq set_ram_is_lower_sermn
+  ; Else, it's upper nibble
+  andi scratch2, 0x0F     ; Clear upper nibble of RAM byte (preserving lower)
+  mov scratch1, reg_temp1 ; Get value to store (from original reg_temp1) into scratch1
+  swap scratch1           ; Move value (0x0X) to upper nibble (0X0)
+  andi scratch1, 0xF0
+  or scratch2, scratch1   ; Combine
+  rjmp set_ram_do_store_sermn
+set_ram_is_lower_sermn:
+  andi scratch2, 0xF0     ; Clear lower nibble of RAM byte (preserving upper)
+  mov scratch1, reg_temp1 ; Get value to store (from original reg_temp1) into scratch1
+  andi scratch1, 0x0F
+  or scratch2, scratch1   ; Combine
+set_ram_do_store_sermn:
+  st Z, scratch2          ; Store modified byte back
+
+  pop ZH
+  pop ZL
+  pop scratch2
+  pop scratch1
+  ret
+
+; Modified version of get_emulated_ram_nibble_location for set_emulated_ram_nibble
+; Input: scratch2 holds nibble address (0-15) from caller
+; Output: Z points to the byte in EMULATED_RAM.
+;         scratch1 gets L/U flag (0 for lower, 1 for upper)
+; Clobbers: ZL, ZH, scratch1. Preserves input scratch2 (nibble address).
+get_emulated_ram_nibble_location_for_set:
+  push scratch2            ; save original nibble address from input scratch2
+  ; scratch1 is free to use as output for L/U flag
+
+  ldi ZL, low(EMULATED_RAM)
+  ldi ZH, high(EMULATED_RAM)
+
+  mov scratch1, scratch2   ; copy address to scratch1 (which becomes L/U flag output and temp for /2)
+  lsr scratch1             ; scratch1 = address / 2 to get byte index
+  add ZL, scratch1         ; Add byte index to ZL
+  adc ZH, __zero_reg__     ; Add carry if any
+
+  ; Determine if original address was odd (upper nibble) or even (lower)
+  ; and put flag in scratch1 (output)
+  andi scratch2, 0x01      ; Check LSB of original address (still in scratch2)
+  mov scratch1, scratch2   ; scratch1 = 0 for lower, 1 for upper (output L/U flag)
+
+  pop scratch2             ; restore original nibble address to input scratch2 (now clean)
+  ret
+
 ;-------------------------------------------------------------------------------
 ; Flag Manipulation Subroutines
 ; reg_flags: Bit 0 = Zero Flag (Z), Bit 1 = Carry Flag (C)
 ;-------------------------------------------------------------------------------
 update_zero_flag:
-  ; Input: reg_accu contains the result of an operation (4-bit value)
-  ; Updates Z flag in reg_flags.
   push reg_temp1
   mov reg_temp1, reg_accu
-  andi reg_temp1, 0x0F    ; Ensure we only check the 4-bit value
-  breq set_zero_flag_do   ; If result is 0, branch to set Z flag
+  andi reg_temp1, 0x0F
+  breq set_zero_flag_do
 clear_zero_flag_do:
-  cbr reg_flags, (1<<FLAG_Z_BIT) ; Clear Z flag
+  cbr reg_flags, (1<<FLAG_Z_BIT)
   pop reg_temp1
   ret
 set_zero_flag_do:
-  sbr reg_flags, (1<<FLAG_Z_BIT)  ; Set Z flag
+  sbr reg_flags, (1<<FLAG_Z_BIT)
   pop reg_temp1
   ret
 
-; update_carry_flag is more instruction specific (e.g. after ADD/SUB)
 set_carry_flag:
   sbr reg_flags, (1<<FLAG_C_BIT)
   ret
 clear_carry_flag:
   cbr reg_flags, (1<<FLAG_C_BIT)
+  ret
+
+;-------------------------------------------------------------------------------
+; PC-Relative Jump Helper
+;-------------------------------------------------------------------------------
+; Input: reg_ir_operand contains the 4-bit signed offset (-8 to +7)
+; Modifies: reg_pc (r18), reg_pc_high_nibble (r2)
+; Uses: reg_temp1 (r16), reg_temp2 (r17) as scratch
+perform_relative_jump:
+  push reg_temp1 ; Save scratch registers
+  push reg_temp2
+
+  mov reg_temp1, reg_ir_operand ; Get the 4-bit operand
+  andi reg_temp1, 0x0F          ; Ensure it's just 4 bits
+
+  ; Sign extend the 4-bit operand (reg_temp1) to an 8-bit offset (reg_temp2 for low byte)
+  ; and determine the high part of a 12-bit offset (which will be 0x00 or 0xFF (effectively -1 for high nibble))
+  mov reg_temp2, reg_temp1      ; Initialize low_offset with the 4-bit value
+
+  sbrc reg_temp1, 3             ; Check sign bit (bit 3 of original 4-bit operand)
+  rjmp offset_is_negative_prjc  ; If bit 3 is set, offset is negative
+
+offset_is_positive_prjc:
+  ; Positive offset (0 to 7)
+  ; Low byte of offset is just reg_temp1 (0x00 to 0x07).
+  ; High part of effective 12-bit offset is 0.
+  ldi reg_temp1, 0x00           ; This will be for the high nibble adjustment
+  push reg_temp1                ; Push high_offset_adjust (0x00)
+  ; reg_temp2 already holds the positive low_offset (0x00-0x07)
+  rjmp add_offset_to_pc_prjc
+
+offset_is_negative_prjc:
+  ; Negative offset (-1 to -8 which is 0xF to 0x8 in 4-bit 2's comp)
+  ; Convert 4-bit two's complement to 8-bit two's complement for low PC part
+  ; e.g., 0b1111 (-1) -> 0xFF. 0b1000 (-8) -> 0xF8.
+  ori reg_temp2, 0xF0           ; Sign extend to 8 bits (e.g., 0b1xxx -> 0b11111xxx)
+                                ; reg_temp2 now holds 8-bit negative offset (0xF8-0xFF)
+  ldi reg_temp1, 0xFF           ; This will be for the high nibble adjustment (effectively -1 if carry from low propagates)
+  push reg_temp1                ; Push high_offset_adjust (0xFF)
+
+add_offset_to_pc_prjc:
+  ; Add 8-bit offset (reg_temp2) to reg_pc (r18 - low byte of PC)
+  add reg_pc, reg_temp2         ; pc_low = pc_low + offset_low
+
+  ; Add high part of offset_adjust (from stack) + carry from low byte addition to reg_pc_high_nibble (r2)
+  pop reg_temp1                 ; reg_temp1 gets high_offset_adjust (0x00 or 0xFF)
+  adc reg_pc_high_nibble, reg_temp1 ; pc_high = pc_high + high_offset_adjust + carry_from_low_add
+
+  andi reg_pc_high_nibble, 0x0F ; Mask pc_high_nibble to 4 bits (0-F page range for 12-bit PC)
+
+  pop reg_temp2 ; Restore scratch registers
+  pop reg_temp1
   ret
 
 ;-------------------------------------------------------------------------------
@@ -932,3 +1163,5 @@ LcdMsg_OUT: .db "OUT:", 0x00
 TestMsg:
   .db "LCD OK!", 0x00
 ; Add more strings here
+
+[end of emulator.asm]
